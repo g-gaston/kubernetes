@@ -18,6 +18,8 @@ package client
 
 import (
 	"context"
+	"crypto/x509"
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -52,6 +54,15 @@ type KubeletClientConfig struct {
 	Lookup egressselector.Lookup
 }
 
+// KubeletClientConfigForNode defines config parameters for the kubelet client for a specific node.
+type KubeletClientConfigForNode struct {
+	KubeletClientConfig
+
+	// NodeName is the name of the node the client will connect to.
+	// This is optional.
+	NodeName string
+}
+
 type KubeletTLSConfig struct {
 	// Server requires TLS client certificate authentication
 	CertFile string
@@ -59,6 +70,10 @@ type KubeletTLSConfig struct {
 	KeyFile string
 	// Trusted root certificates for server
 	CAFile string
+	// ValidateNodeNameInCertCN specifies whether the kubelet
+	// client should validate the node name in the kubelet
+	//  server certificate common name.
+	ValidateNodeNameInCertCN bool
 }
 
 // ConnectionInfo provides the information needed to connect to a kubelet
@@ -77,16 +92,25 @@ type ConnectionInfoGetter interface {
 
 // MakeTransport creates a secure RoundTripper for HTTP Transport.
 func MakeTransport(config *KubeletClientConfig) (http.RoundTripper, error) {
-	return makeTransport(config, false)
+	return makeTransport(&KubeletClientConfigForNode{KubeletClientConfig: *config}, false)
 }
 
 // MakeInsecureTransport creates an insecure RoundTripper for HTTP Transport.
 func MakeInsecureTransport(config *KubeletClientConfig) (http.RoundTripper, error) {
-	return makeTransport(config, true)
+	return makeTransport(&KubeletClientConfigForNode{KubeletClientConfig: *config}, true)
+}
+
+// MakeTransportForNode creates a secure RoundTripper for HTTP Transport to connect to a specific Node.
+func MakeTransportForNode(config *KubeletClientConfigForNode) (http.RoundTripper, error) {
+	return makeTransport(config, false)
 }
 
 // makeTransport creates a RoundTripper for HTTP Transport.
-func makeTransport(config *KubeletClientConfig, insecureSkipTLSVerify bool) (http.RoundTripper, error) {
+func makeTransport(config *KubeletClientConfigForNode, insecureSkipTLSVerify bool) (http.RoundTripper, error) {
+	if config.TLSClientConfig.ValidateNodeNameInCertCN && config.NodeName == "" {
+		return nil, fmt.Errorf("kubelet client config NodeName must be set when ValidateNodeNameInCertCN is true")
+	}
+
 	// do the insecureSkipTLSVerify on the pre-transport *before* we go get a potentially cached connection.
 	// transportConfig always produces a new struct pointer.
 	transportConfig := config.transportConfig()
@@ -111,7 +135,7 @@ func makeTransport(config *KubeletClientConfig, insecureSkipTLSVerify bool) (htt
 }
 
 // transportConfig converts a client config to an appropriate transport config.
-func (c *KubeletClientConfig) transportConfig() *transport.Config {
+func (c *KubeletClientConfigForNode) transportConfig() *transport.Config {
 	cfg := &transport.Config{
 		TLS: transport.TLSConfig{
 			CAFile:   c.TLSClientConfig.CAFile,
@@ -125,6 +149,17 @@ func (c *KubeletClientConfig) transportConfig() *transport.Config {
 	if !cfg.HasCA() {
 		cfg.TLS.Insecure = true
 	}
+
+	if c.TLSClientConfig.ValidateNodeNameInCertCN && c.NodeName != "" {
+		// TODO(gaslor): if we want transport to cache the round tripper,
+		// we need to cache the holder and reuse it.
+		cfg.TLS.VerifyPeerCertificateHolder = &transport.VerifyPeerCertificateHolder{
+			VerifyPeerCertificate: []func(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error{
+				validateNodeNameInCertCN(c.NodeName),
+			},
+		}
+	}
+
 	return cfg
 }
 
@@ -147,10 +182,8 @@ type NodeConnectionInfoGetter struct {
 	nodes NodeGetter
 	// scheme is the scheme to use to connect to all kubelets
 	scheme string
-	// defaultPort is the port to use if no Kubelet endpoint port is recorded in the node status
-	defaultPort int
-	// transport is the transport to use to send a request to all kubelets
-	transport http.RoundTripper
+	// config defines config parameters for the kubelet client.
+	config KubeletClientConfig
 	// insecureSkipTLSVerifyTransport is the transport to use if the kube-apiserver wants to skip verifying the TLS certificate of the kubelet
 	insecureSkipTLSVerifyTransport http.RoundTripper
 	// preferredAddressTypes specifies the preferred order to use to find a node address
@@ -159,10 +192,6 @@ type NodeConnectionInfoGetter struct {
 
 // NewNodeConnectionInfoGetter creates a new NodeConnectionInfoGetter.
 func NewNodeConnectionInfoGetter(nodes NodeGetter, config KubeletClientConfig) (ConnectionInfoGetter, error) {
-	transport, err := MakeTransport(&config)
-	if err != nil {
-		return nil, err
-	}
 	insecureSkipTLSVerifyTransport, err := MakeInsecureTransport(&config)
 	if err != nil {
 		return nil, err
@@ -176,8 +205,7 @@ func NewNodeConnectionInfoGetter(nodes NodeGetter, config KubeletClientConfig) (
 	return &NodeConnectionInfoGetter{
 		nodes:                          nodes,
 		scheme:                         "https",
-		defaultPort:                    int(config.Port),
-		transport:                      transport,
+		config:                         config,
 		insecureSkipTLSVerifyTransport: insecureSkipTLSVerifyTransport,
 
 		preferredAddressTypes: types,
@@ -200,14 +228,42 @@ func (k *NodeConnectionInfoGetter) GetConnectionInfo(ctx context.Context, nodeNa
 	// Use the kubelet-reported port, if present
 	port := int(node.Status.DaemonEndpoints.KubeletEndpoint.Port)
 	if port <= 0 {
-		port = k.defaultPort
+		port = int(k.config.Port)
+	}
+
+	transport, err := MakeTransportForNode(&KubeletClientConfigForNode{k.config, string(nodeName)})
+	if err != nil {
+		return nil, err
 	}
 
 	return &ConnectionInfo{
 		Scheme:                         k.scheme,
 		Hostname:                       host,
 		Port:                           strconv.Itoa(port),
-		Transport:                      k.transport,
+		Transport:                      transport,
 		InsecureSkipTLSVerifyTransport: k.insecureSkipTLSVerifyTransport,
 	}, nil
+}
+
+func validateNodeNameInCertCN(nodeName string) func(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error {
+	expectedCN := "system:node:" + nodeName
+	return func(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error {
+		for _, chain := range verifiedChains {
+			first := chain[0]
+			if first == nil || len(first.Subject.Organization) == 0 {
+				continue
+			}
+			if first.Subject.Organization[0] != "system:nodes" {
+				continue
+			}
+
+			if first.Subject.CommonName != expectedCN {
+				return fmt.Errorf("kubelet serving cert CN %s doesn't match expected %s", first.Subject.CommonName, expectedCN)
+			}
+
+			return nil
+		}
+
+		return errors.New("didn't find any valid kubelet serving cert in the verified certificates chains")
+	}
 }

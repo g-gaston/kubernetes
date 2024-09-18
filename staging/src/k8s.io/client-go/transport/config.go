@@ -19,6 +19,7 @@ package transport
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"net"
 	"net/http"
 	"net/url"
@@ -152,9 +153,21 @@ type TLSConfig struct {
 	// Callback that returns a TLS client certificate. CertData, CertFile, KeyData and KeyFile supercede this field.
 	// This struct indirection is used to make transport configs cacheable.
 	GetCertHolder *GetCertHolder
+
+	// VerifyPeerCertificateHolder is called after the normal certificate verification by the TLS client.
+	// As soon as any of the validations return a non-nil error, the handshake is aborted and that error is returned.
+	// This struct indirection is used to make transport configs cacheable.
+	//
+	// For more info see https://golang.org/pkg/crypto/tls/#Config.VerifyPeerCertificateHolder
+	VerifyPeerCertificateHolder *VerifyPeerCertificateHolder
 }
 
 // GetCertHolder is used to make the wrapped function comparable so that it can be used as a map key.
 type GetCertHolder struct {
 	GetCert func() (*tls.Certificate, error)
+}
+
+// VerifyPeerCertificateHolder is used to make the wrapped function comparable so that it can be used as a map key.
+type VerifyPeerCertificateHolder struct {
+	VerifyPeerCertificate []func(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error
 }

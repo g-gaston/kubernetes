@@ -58,8 +58,9 @@ type tlsCacheKey struct {
 	nextProtos         string
 	disableCompression bool
 	// these functions are wrapped to allow them to be used as map keys
-	getCert *GetCertHolder
-	dial    *DialHolder
+	getCert               *GetCertHolder
+	dial                  *DialHolder
+	verifyPeerCertificate *VerifyPeerCertificateHolder
 }
 
 func (t tlsCacheKey) String() string {
@@ -157,13 +158,14 @@ func tlsConfigKey(c *Config) (tlsCacheKey, bool, error) {
 	}
 
 	k := tlsCacheKey{
-		insecure:           c.TLS.Insecure,
-		caData:             string(c.TLS.CAData),
-		serverName:         c.TLS.ServerName,
-		nextProtos:         strings.Join(c.TLS.NextProtos, ","),
-		disableCompression: c.DisableCompression,
-		getCert:            c.TLS.GetCertHolder,
-		dial:               c.DialHolder,
+		insecure:              c.TLS.Insecure,
+		caData:                string(c.TLS.CAData),
+		serverName:            c.TLS.ServerName,
+		nextProtos:            strings.Join(c.TLS.NextProtos, ","),
+		disableCompression:    c.DisableCompression,
+		getCert:               c.TLS.GetCertHolder,
+		verifyPeerCertificate: c.TLS.VerifyPeerCertificateHolder,
+		dial:                  c.DialHolder,
 	}
 
 	if c.TLS.ReloadTLSFiles {

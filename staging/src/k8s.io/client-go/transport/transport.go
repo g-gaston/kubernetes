@@ -95,6 +95,17 @@ func TLSConfigFor(c *Config) (*tls.Config, error) {
 		NextProtos:         c.TLS.NextProtos,
 	}
 
+	if c.TLS.VerifyPeerCertificateHolder != nil && len(c.TLS.VerifyPeerCertificateHolder.VerifyPeerCertificate) > 0 {
+		tlsConfig.VerifyPeerCertificate = func(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error {
+			for _, f := range c.TLS.VerifyPeerCertificateHolder.VerifyPeerCertificate {
+				if err := f(rawCerts, verifiedChains); err != nil {
+					return err
+				}
+			}
+			return nil
+		}
+	}
+
 	if c.HasCA() {
 		/*
 			kubernetes mutual (2-way) x509 between client and apiserver:
@@ -147,7 +158,6 @@ func TLSConfigFor(c *Config) (*tls.Config, error) {
 	}
 
 	if c.HasCertAuth() || c.HasCertCallback() {
-
 		/*
 			    kubernetes mutual (2-way) x509 between client and apiserver:
 

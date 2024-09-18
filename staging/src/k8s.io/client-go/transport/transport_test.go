@@ -19,6 +19,7 @@ package transport
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"net"
@@ -103,14 +104,16 @@ func TestNew(t *testing.T) {
 	}
 
 	testCases := map[string]struct {
-		Config       *Config
-		Err          bool
-		TLS          bool
-		TLSCert      bool
-		TLSErr       bool
-		Default      bool
-		Insecure     bool
-		DefaultRoots bool
+		Config           *Config
+		Err              bool
+		TLS              bool
+		TLSCert          bool
+		TLSErr           bool
+		TLSVerifyCert    bool
+		TLSVerifyCertErr bool
+		Default          bool
+		Insecure         bool
+		DefaultRoots     bool
 	}{
 		"default transport": {
 			Default: true,
@@ -274,17 +277,19 @@ func TestNew(t *testing.T) {
 		"nil holders": {
 			Config: &Config{
 				TLS: TLSConfig{
-					GetCertHolder: nil,
+					GetCertHolder:               nil,
+					VerifyPeerCertificateHolder: nil,
 				},
 				DialHolder: nil,
 			},
-			Err:          false,
-			TLS:          false,
-			TLSCert:      false,
-			TLSErr:       false,
-			Default:      true,
-			Insecure:     false,
-			DefaultRoots: false,
+			Err:           false,
+			TLS:           false,
+			TLSCert:       false,
+			TLSVerifyCert: false,
+			TLSErr:        false,
+			Default:       true,
+			Insecure:      false,
+			DefaultRoots:  false,
 		},
 		"non-nil dial holder and nil internal": {
 			Config: &Config{
@@ -353,6 +358,51 @@ func TestNew(t *testing.T) {
 			Insecure:     false,
 			DefaultRoots: true,
 		},
+		"validate certificate, returns nil": {
+			TLS:           true,
+			TLSCert:       true,
+			TLSVerifyCert: true,
+			Config: &Config{
+				TLS: TLSConfig{
+					CAData:   []byte(rootCACert),
+					CertData: []byte(certData),
+					KeyData:  []byte(keyData),
+					VerifyPeerCertificateHolder: &VerifyPeerCertificateHolder{
+						VerifyPeerCertificate: []func(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error{
+							func(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error {
+								return nil
+							},
+							func(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error {
+								return nil
+							},
+						},
+					},
+				},
+			},
+		},
+		"validate certificate, returns error": {
+			TLS:              true,
+			TLSCert:          true,
+			TLSVerifyCert:    true,
+			TLSVerifyCertErr: true,
+			Config: &Config{
+				TLS: TLSConfig{
+					CAData:   []byte(rootCACert),
+					CertData: []byte(certData),
+					KeyData:  []byte(keyData),
+					VerifyPeerCertificateHolder: &VerifyPeerCertificateHolder{
+						VerifyPeerCertificate: []func(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error{
+							func(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error {
+								return nil
+							},
+							func(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error {
+								return errors.New("failed")
+							},
+						},
+					},
+				},
+			},
+		},
 	}
 	for k, testCase := range testCases {
 		t.Run(k, func(t *testing.T) {
@@ -404,16 +454,33 @@ func TestNew(t *testing.T) {
 			case !testCase.TLSCert && transport.TLSClientConfig.GetClientCertificate != nil:
 				t.Fatalf("got %#v, expected no TLSClientConfig.GetClientCertificate", transport.TLSClientConfig)
 			}
-			if !testCase.TLSCert {
+			if testCase.TLSCert {
+				_, err = transport.TLSClientConfig.GetClientCertificate(nil)
+				switch {
+				case testCase.TLSErr && err == nil:
+					t.Error("got nil error from GetClientCertificate, expected non-nil")
+				case !testCase.TLSErr && err != nil:
+					t.Errorf("got error from GetClientCertificate: %q, expected nil", err)
+				}
+			}
+
+			switch {
+			case testCase.TLSVerifyCert && transport.TLSClientConfig.VerifyPeerCertificate == nil:
+				t.Fatalf("got %#v, expected TLSClientConfig.VerifyPeerCertificate", transport.TLSClientConfig)
+			case !testCase.TLSVerifyCert && transport.TLSClientConfig.VerifyPeerCertificate != nil:
+				t.Fatalf("got %#v, expected no TLSClientConfig.VerifyPeerCertificate", transport.TLSClientConfig)
+			}
+
+			if !testCase.TLSVerifyCert {
 				return
 			}
 
-			_, err = transport.TLSClientConfig.GetClientCertificate(nil)
+			err = transport.TLSClientConfig.VerifyPeerCertificate(nil, nil)
 			switch {
-			case testCase.TLSErr && err == nil:
-				t.Error("got nil error from GetClientCertificate, expected non-nil")
-			case !testCase.TLSErr && err != nil:
-				t.Errorf("got error from GetClientCertificate: %q, expected nil", err)
+			case testCase.TLSVerifyCertErr && err == nil:
+				t.Error("got nil error from VerifyPeerCertificate expected non-nil")
+			case !testCase.TLSVerifyCertErr && err != nil:
+				t.Errorf("got error from VerifyPeerCertificate: %q, expected nil", err)
 			}
 		})
 	}

@@ -19,6 +19,7 @@ package transport
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"net"
 	"net/http"
 	"net/url"
@@ -70,99 +71,167 @@ func TestTLSConfigKey(t *testing.T) {
 	// Make sure config fields that affect the tls config affect the cache key
 	dialer := net.Dialer{}
 	getCert := &GetCertHolder{GetCert: func() (*tls.Certificate, error) { return nil, nil }}
-	uniqueConfigurations := map[string]*Config{
-		"proxy":    {Proxy: func(request *http.Request) (*url.URL, error) { return nil, nil }},
-		"no tls":   {},
-		"dialer":   {DialHolder: &DialHolder{Dial: dialer.DialContext}},
-		"dialer2":  {DialHolder: &DialHolder{Dial: func(ctx context.Context, network, address string) (net.Conn, error) { return nil, nil }}},
-		"insecure": {TLS: TLSConfig{Insecure: true}},
-		"cadata 1": {TLS: TLSConfig{CAData: []byte{1}}},
-		"cadata 2": {TLS: TLSConfig{CAData: []byte{2}}},
+	uniqueConfigurations := map[string]struct {
+		config      *Config
+		shouldCache bool
+	}{
+		"proxy": {
+			config:      &Config{Proxy: func(request *http.Request) (*url.URL, error) { return nil, nil }},
+			shouldCache: false,
+		},
+		"no tls": {
+			config:      &Config{},
+			shouldCache: true,
+		},
+		"dialer": {
+			config:      &Config{DialHolder: &DialHolder{Dial: dialer.DialContext}},
+			shouldCache: true,
+		},
+		"dialer2": {
+			config:      &Config{DialHolder: &DialHolder{Dial: func(ctx context.Context, network, address string) (net.Conn, error) { return nil, nil }}},
+			shouldCache: true,
+		},
+		"cert validation": {
+			config: &Config{TLS: TLSConfig{VerifyPeerCertificateHolder: &VerifyPeerCertificateHolder{
+				VerifyPeerCertificate: []func(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error{
+					func(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error { return nil },
+				},
+			}}},
+			shouldCache: true,
+		},
+		"insecure": {
+			config:      &Config{TLS: TLSConfig{Insecure: true}},
+			shouldCache: true,
+		},
+		"cadata 1": {
+			config:      &Config{TLS: TLSConfig{CAData: []byte{1}}},
+			shouldCache: true,
+		},
+		"cadata 2": {
+			config:      &Config{TLS: TLSConfig{CAData: []byte{2}}},
+			shouldCache: true,
+		},
 		"cert 1, key 1": {
-			TLS: TLSConfig{
-				CertData: []byte{1},
-				KeyData:  []byte{1},
+			config: &Config{
+				TLS: TLSConfig{
+					CertData: []byte{1},
+					KeyData:  []byte{1},
+				},
 			},
+			shouldCache: true,
 		},
 		"cert 1, key 1, servername 1": {
-			TLS: TLSConfig{
-				CertData:   []byte{1},
-				KeyData:    []byte{1},
-				ServerName: "1",
+			config: &Config{
+				TLS: TLSConfig{
+					CertData:   []byte{1},
+					KeyData:    []byte{1},
+					ServerName: "1",
+				},
 			},
+			shouldCache: true,
 		},
 		"cert 1, key 1, servername 2": {
-			TLS: TLSConfig{
-				CertData:   []byte{1},
-				KeyData:    []byte{1},
-				ServerName: "2",
+			config: &Config{
+				TLS: TLSConfig{
+					CertData:   []byte{1},
+					KeyData:    []byte{1},
+					ServerName: "2",
+				},
 			},
+			shouldCache: true,
 		},
 		"cert 1, key 2": {
-			TLS: TLSConfig{
-				CertData: []byte{1},
-				KeyData:  []byte{2},
+			config: &Config{
+				TLS: TLSConfig{
+					CertData: []byte{1},
+					KeyData:  []byte{2},
+				},
 			},
+			shouldCache: true,
 		},
 		"cert 2, key 1": {
-			TLS: TLSConfig{
-				CertData: []byte{2},
-				KeyData:  []byte{1},
+			config: &Config{
+				TLS: TLSConfig{
+					CertData: []byte{2},
+					KeyData:  []byte{1},
+				},
 			},
+			shouldCache: true,
 		},
 		"cert 2, key 2": {
-			TLS: TLSConfig{
-				CertData: []byte{2},
-				KeyData:  []byte{2},
+			config: &Config{
+				TLS: TLSConfig{
+					CertData: []byte{2},
+					KeyData:  []byte{2},
+				},
 			},
+			shouldCache: true,
 		},
 		"cadata 1, cert 1, key 1": {
-			TLS: TLSConfig{
-				CAData:   []byte{1},
-				CertData: []byte{1},
-				KeyData:  []byte{1},
+			config: &Config{
+				TLS: TLSConfig{
+					CAData:   []byte{1},
+					CertData: []byte{1},
+					KeyData:  []byte{1},
+				},
 			},
+			shouldCache: true,
 		},
 		"getCert1": {
-			TLS: TLSConfig{
-				KeyData:       []byte{1},
-				GetCertHolder: getCert,
+			config: &Config{
+				TLS: TLSConfig{
+					KeyData:       []byte{1},
+					GetCertHolder: getCert,
+				},
 			},
+			shouldCache: true,
 		},
 		"getCert2": {
-			TLS: TLSConfig{
-				KeyData:       []byte{1},
-				GetCertHolder: &GetCertHolder{GetCert: func() (*tls.Certificate, error) { return nil, nil }},
+			config: &Config{
+				TLS: TLSConfig{
+					KeyData:       []byte{1},
+					GetCertHolder: &GetCertHolder{GetCert: func() (*tls.Certificate, error) { return nil, nil }},
+				},
 			},
+			shouldCache: true,
 		},
 		"getCert1, key 2": {
-			TLS: TLSConfig{
-				KeyData:       []byte{2},
-				GetCertHolder: getCert,
+			config: &Config{
+				TLS: TLSConfig{
+					KeyData:       []byte{2},
+					GetCertHolder: getCert,
+				},
 			},
+			shouldCache: true,
 		},
-		"http2, http1.1": {TLS: TLSConfig{NextProtos: []string{"h2", "http/1.1"}}},
-		"http1.1-only":   {TLS: TLSConfig{NextProtos: []string{"http/1.1"}}},
+		"http2, http1.1": {
+			config:      &Config{TLS: TLSConfig{NextProtos: []string{"h2", "http/1.1"}}},
+			shouldCache: true,
+		},
+		"http1.1-only": {
+			config:      &Config{TLS: TLSConfig{NextProtos: []string{"http/1.1"}}},
+			shouldCache: true,
+		},
 	}
 	for nameA, valueA := range uniqueConfigurations {
 		for nameB, valueB := range uniqueConfigurations {
-			keyA, canCacheA, err := tlsConfigKey(valueA)
+			keyA, canCacheA, err := tlsConfigKey(valueA.config)
 			if err != nil {
 				t.Errorf("Unexpected error for %q: %v", nameA, err)
 				continue
 			}
-			keyB, canCacheB, err := tlsConfigKey(valueB)
+			keyB, canCacheB, err := tlsConfigKey(valueB.config)
 			if err != nil {
 				t.Errorf("Unexpected error for %q: %v", nameB, err)
 				continue
 			}
 
-			shouldCacheA := valueA.Proxy == nil
+			shouldCacheA := valueA.shouldCache
 			if shouldCacheA != canCacheA {
 				t.Errorf("Unexpected canCache=false for " + nameA)
 			}
 
-			configIsNotEmpty := !reflect.DeepEqual(*valueA, Config{})
+			configIsNotEmpty := !reflect.DeepEqual(*valueA.config, Config{})
 			if keyA == (tlsCacheKey{}) && shouldCacheA && configIsNotEmpty {
 				t.Errorf("Expected non-empty cache keys for %q and %q, got:\n\t%s\n\t%s", nameA, nameB, keyA, keyB)
 				continue
