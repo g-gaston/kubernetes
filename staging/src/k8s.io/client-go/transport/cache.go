@@ -106,7 +106,13 @@ func (c *tlsTransportCache) get(config *Config) (http.RoundTripper, error) {
 
 	var dial func(ctx context.Context, network, address string) (net.Conn, error)
 	if config.DialHolder != nil {
-		dial = config.DialHolder.Dial
+		if config.DialHolder.Dial != nil {
+			dial = config.DialHolder.Dial
+		} else if config.DialHolder.DialWithTLS != nil {
+			dial = func(ctx context.Context, network, address string) (net.Conn, error) {
+				return config.DialHolder.DialWithTLS(ctx, tlsConfig, network, address)
+			}
+		}
 	} else {
 		dial = (&net.Dialer{
 			Timeout:   30 * time.Second,
@@ -131,14 +137,21 @@ func (c *tlsTransportCache) get(config *Config) (http.RoundTripper, error) {
 		proxy = config.Proxy
 	}
 
-	transport := utilnet.SetTransportDefaults(&http.Transport{
+	transport := &http.Transport{
 		Proxy:               proxy,
 		TLSHandshakeTimeout: 10 * time.Second,
 		TLSClientConfig:     tlsConfig,
 		MaxIdleConnsPerHost: idleConnsPerHost,
-		DialContext:         dial,
 		DisableCompression:  config.DisableCompression,
-	})
+	}
+
+	if config.DialHolder != nil && config.DialHolder.DialWithTLS != nil {
+		transport.DialTLSContext = dial
+	} else {
+		transport.DialContext = dial
+	}
+
+	utilnet.SetTransportDefaults(transport)
 
 	if canCache {
 		// Cache a single transport for these options

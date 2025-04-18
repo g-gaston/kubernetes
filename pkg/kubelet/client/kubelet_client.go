@@ -22,16 +22,13 @@ import (
 	"fmt"
 	"net"
 	"net/http"
-	"net/http/httptrace"
 	"slices"
 	"strconv"
-	"sync"
 	"time"
 
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
-	utilerrors "k8s.io/apimachinery/pkg/util/errors"
 	utilnet "k8s.io/apimachinery/pkg/util/net"
 	"k8s.io/apiserver/pkg/authentication/user"
 	"k8s.io/apiserver/pkg/server/egressselector"
@@ -95,6 +92,9 @@ func MakeInsecureTransport(config *KubeletClientConfig) (http.RoundTripper, erro
 	return makeTransport(config, true)
 }
 
+// cnNameValidatorKey is a context key for the cnNameValidator.
+type cnNameValidatorKey struct{}
+
 // makeTransport creates a RoundTripper for HTTP Transport.
 func makeTransport(config *KubeletClientConfig, insecureSkipTLSVerify bool) (http.RoundTripper, error) {
 	// do the insecureSkipTLSVerify on the pre-transport *before* we go get a potentially cached connection.
@@ -115,6 +115,28 @@ func makeTransport(config *KubeletClientConfig, insecureSkipTLSVerify bool) (htt
 		}
 		if dialer != nil {
 			transportConfig.DialHolder = &transport.DialHolder{Dial: dialer}
+		}
+	} else if config.TLSClientConfig.ValidateNodeName {
+		transportConfig.DialHolder = &transport.DialHolder{
+			DialWithTLS: func(ctx context.Context, cfg *tls.Config, network, addr string) (net.Conn, error) {
+				validator := ctx.Value(cnNameValidatorKey{})
+				cnNameValidator, ok := validator.(func(cs tls.ConnectionState) error)
+
+				tlsConfig := cfg.Clone()
+				if ok && cnNameValidator != nil {
+					tlsConfig.VerifyConnection = cnNameValidator
+				}
+
+				dialer := tls.Dialer{
+					NetDialer: &net.Dialer{
+						Timeout:   30 * time.Second,
+						KeepAlive: 30 * time.Second,
+					},
+					Config: tlsConfig,
+				}
+
+				return dialer.DialContext(ctx, network, addr)
+			},
 		}
 	}
 	return transport.New(transportConfig)
@@ -247,81 +269,14 @@ func (r *validateNodeNameRoundTripper) WrappedRoundTripper() http.RoundTripper {
 }
 
 func (r *validateNodeNameRoundTripper) RoundTrip(req *http.Request) (rtResp *http.Response, rtErr error) {
-	ctx, cancel := context.WithCancelCause(req.Context())
-	defer func() {
-		if rtErr == nil {
-			return
-		}
-		cancel(nil) // TODO: are we supposed to always cancel here, I think not because that would mess up body streaming?
-	}()
+	ctx := req.Context()
+	ctx = context.WithValue(ctx, cnNameValidatorKey{}, r.validateNodeName)
+	req = req.Clone(ctx) // swap the context
 
-	req = req.Clone(ctx) // so that we can mutate this request
-
-	var (
-		lock      sync.Mutex // trace functions may be called concurrently from different goroutines
-		failedErr error
-		validated bool
-	)
-	defer func() {
-		lock.Lock()
-		defer lock.Unlock()
-
-		if !validated && failedErr == nil {
-			rtErr = newAggregateWithCleaning(errNodeNameValidationSkipped, rtErr)
-		}
-
-		if failedErr != nil && failedErr != rtErr {
-			rtErr = newAggregateWithCleaning(failedErr, rtErr)
-		}
-
-		if rtErr != nil {
-			if rtResp != nil && rtResp.Body != nil {
-				_ = rtResp.Body.Close()
-			}
-			rtResp = nil
-		}
-	}()
-
-	trace := &httptrace.ClientTrace{
-		// the easiest thing would be to panic here and while that would likely work today because everything is
-		// within the same goroutine, the docs for httptrace state that different goroutines may be used meaning
-		// that in the future such a panic could cause the entire process to terminate
-		GotConn: func(connInfo httptrace.GotConnInfo) {
-			lock.Lock()
-			defer lock.Unlock()
-
-			if failedErr != nil {
-				return
-			}
-
-			if err := r.validateNodeName(connInfo.Conn); err != nil {
-				failedErr = err // TODO decide on klog / audit log / metrics around this
-				cancel(err)     // best effort request cancellation
-
-				// make it impossible for the request to be sent
-				// TODO decide if making the request invalid like this makes sense
-				invalidRequest := new(http.Request).WithContext(req.Context())
-				*req = *invalidRequest
-				return
-			}
-
-			validated = true // make sure the validation is actually called
-		},
-	}
-
-	req = req.WithContext(httptrace.WithClientTrace(ctx, trace)) // WithClientTrace automatically composes with any existing trace
 	return r.delegate.RoundTrip(req)
 }
 
-func (r *validateNodeNameRoundTripper) validateNodeName(conn net.Conn) error {
-	tlsConn, ok := conn.(*tls.Conn)
-	if !ok {
-		return fmt.Errorf("invalid connection type; expected tls.Conn, got %T", conn)
-	}
-	cs := tlsConn.ConnectionState()
-	if !cs.HandshakeComplete {
-		return fmt.Errorf("invalid connection state; handshake not complete")
-	}
+func (r *validateNodeNameRoundTripper) validateNodeName(cs tls.ConnectionState) error {
 	leaf := cs.PeerCertificates[0]
 	if expectedNodeName := "system:node:" + string(r.nodeName); leaf.Subject.CommonName != expectedNodeName {
 		return fmt.Errorf("invalid node name; expected %q, got %q", expectedNodeName, leaf.Subject.CommonName)
@@ -330,8 +285,4 @@ func (r *validateNodeNameRoundTripper) validateNodeName(conn net.Conn) error {
 		return fmt.Errorf("invalid node groups; expected to include %q, got %q", user.NodesGroup, leaf.Subject.Organization)
 	}
 	return nil
-}
-
-func newAggregateWithCleaning(errs ...error) error {
-	return utilerrors.Reduce(utilerrors.FilterOut(utilerrors.NewAggregate(errs), func(err error) bool { return err == context.Canceled }))
 }

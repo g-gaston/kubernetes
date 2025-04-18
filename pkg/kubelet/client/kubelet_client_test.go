@@ -135,8 +135,14 @@ func TestMakeInsecureTransport(t *testing.T) {
 }
 
 func TestValidateNodeName(t *testing.T) {
-	const nodeName = "my-node-1"
-	kubeletServer := newKubeletServer(t, nodeName)
+	caCert, caKey := createCA(t)
+	caPath := filepath.Join(t.TempDir(), "ca.crt")
+	if err := os.WriteFile(caPath, utils.EncodeCertPEM(caCert), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	kubeletServerNode1 := newKubeletServer(t, "my-node-1", caCert, caKey)
+	kubeletServerNode2 := newKubeletServer(t, "my-node-2", caCert, caKey)
 
 	nodeGetter := NodeGetterFunc(func(ctx context.Context, name string, options metav1.GetOptions) (*corev1.Node, error) {
 		return &corev1.Node{
@@ -155,7 +161,7 @@ func TestValidateNodeName(t *testing.T) {
 
 	kubeletClientConfig := KubeletClientConfig{
 		TLSClientConfig: KubeletTLSConfig{
-			CAFile:           kubeletServer.caFilePath,
+			CAFile:           caPath,
 			ValidateNodeName: false,
 		},
 		PreferredAddressTypes: []string{
@@ -178,25 +184,29 @@ func TestValidateNodeName(t *testing.T) {
 
 	testCases := []struct {
 		name                 string
+		kubeletServer        *fakeKubeletServer
 		nodeName             types.NodeName
 		connectionInfoGetter ConnectionInfoGetter
 		expectErr            string
 	}{
 		{
 			name:                 "valid cert",
-			nodeName:             nodeName,
+			nodeName:             "my-node-1",
+			kubeletServer:        kubeletServerNode1,
 			connectionInfoGetter: nodeConnectionInfoGetterWithValidateNodeName,
 		},
 		{
 			name:                 "invalid cert without validation",
-			nodeName:             "my-node-2",
+			nodeName:             "my-node-1",
+			kubeletServer:        kubeletServerNode2,
 			connectionInfoGetter: nodeConnectionInfoGetter,
 		},
 		{
 			name:                 "invalid cert with validation",
-			nodeName:             "my-node-2",
+			nodeName:             "my-node-1",
+			kubeletServer:        kubeletServerNode2,
 			connectionInfoGetter: nodeConnectionInfoGetterWithValidateNodeName,
-			expectErr:            `invalid node name; expected "system:node:my-node-2", got "system:node:my-node-1"`,
+			expectErr:            `invalid node name; expected "system:node:my-node-1", got "system:node:my-node-2"`,
 		},
 	}
 	for _, tc := range testCases {
@@ -206,14 +216,14 @@ func TestValidateNodeName(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			req, err := http.NewRequest(http.MethodGet, kubeletServer.server.URL, nil)
+			req, err := http.NewRequest(http.MethodGet, tc.kubeletServer.server.URL, nil)
 			if err != nil {
 				t.Fatal(err)
 			}
 			response, err := nodeInfo.Transport.RoundTrip(req)
 
 			if got := errString(err); tc.expectErr != got {
-				t.Fatalf("expected error %q but got %q", tc.expectErr, got)
+				t.Fatalf("expected error %q but got %v", tc.expectErr, err)
 			}
 
 			if err == nil && response.StatusCode != http.StatusOK {
@@ -228,13 +238,10 @@ func TestValidateNodeName(t *testing.T) {
 }
 
 type fakeKubeletServer struct {
-	server     *httptest.Server
-	caFilePath string
+	server *httptest.Server
 }
 
-func newKubeletServer(tb testing.TB, nodeName string) *fakeKubeletServer {
-	signingCert, signingKey := createCA(tb)
-
+func newKubeletServer(tb testing.TB, nodeName string, signingCert *x509.Certificate, signingKey crypto.Signer) *fakeKubeletServer {
 	servingCert := createServingCert(tb, signingCert, signingKey, nodeName)
 
 	testServer := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
@@ -250,14 +257,8 @@ func newKubeletServer(tb testing.TB, nodeName string) *fakeKubeletServer {
 	testServer.StartTLS()
 	tb.Cleanup(testServer.Close)
 
-	caPath := filepath.Join(tb.TempDir(), "ca.crt")
-	if err := os.WriteFile(caPath, utils.EncodeCertPEM(signingCert), 0o644); err != nil {
-		tb.Fatal(err)
-	}
-
 	return &fakeKubeletServer{
-		server:     testServer,
-		caFilePath: caPath,
+		server: testServer,
 	}
 }
 

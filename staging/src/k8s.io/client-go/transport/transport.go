@@ -65,7 +65,7 @@ func isValidHolders(config *Config) bool {
 		return false
 	}
 
-	if config.DialHolder != nil && config.DialHolder.Dial == nil {
+	if config.DialHolder != nil && ((config.DialHolder.Dial == nil && config.DialHolder.DialWithTLS == nil) || (config.DialHolder.Dial != nil && config.DialHolder.DialWithTLS != nil)) {
 		return false
 	}
 
@@ -147,7 +147,6 @@ func TLSConfigFor(c *Config) (*tls.Config, error) {
 	}
 
 	if c.HasCertAuth() || c.HasCertCallback() {
-
 		/*
 			    kubernetes mutual (2-way) x509 between client and apiserver:
 
