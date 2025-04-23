@@ -110,7 +110,7 @@ func (c *tlsTransportCache) get(config *Config) (http.RoundTripper, error) {
 			dial = config.DialHolder.Dial
 		} else if config.DialHolder.DialWithTLS != nil {
 			dial = func(ctx context.Context, network, address string) (net.Conn, error) {
-				return config.DialHolder.DialWithTLS(ctx, tlsConfig, network, address)
+				return config.DialHolder.DialWithTLS(ctx, tlsConfig.Clone(), network, address)
 			}
 		}
 	} else {

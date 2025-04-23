@@ -21,6 +21,7 @@ import (
 	"crypto"
 	"crypto/tls"
 	"crypto/x509"
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -144,6 +145,123 @@ func TestValidateNodeName(t *testing.T) {
 	kubeletServerNode1 := newKubeletServer(t, "my-node-1", caCert, caKey)
 	kubeletServerNode2 := newKubeletServer(t, "my-node-2", caCert, caKey)
 
+	baseKubeletClientConfig := KubeletClientConfig{
+		TLSClientConfig: KubeletTLSConfig{
+			CAFile: caPath,
+		},
+		PreferredAddressTypes: []string{
+			string(corev1.NodeInternalIP),
+		},
+	}
+
+	// TODO test with multiple nodes and with connection re-use
+
+	testCases := []struct {
+		name             string
+		kubeletServer    *fakeKubeletServer
+		nodeName         types.NodeName
+		validateNodeName bool
+		expectErr        string
+	}{
+		{
+			name:             "valid cert",
+			nodeName:         "my-node-1",
+			kubeletServer:    kubeletServerNode1,
+			validateNodeName: true,
+		},
+		{
+			name:             "invalid cert without validation",
+			nodeName:         "my-node-1",
+			kubeletServer:    kubeletServerNode2,
+			validateNodeName: false,
+		},
+		{
+			name:             "invalid cert with validation",
+			nodeName:         "my-node-1",
+			kubeletServer:    kubeletServerNode2,
+			validateNodeName: true,
+			expectErr:        `invalid node name; expected "system:node:my-node-1", got "system:node:my-node-2"`,
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			nodeGetter := NodeGetterFunc(func(ctx context.Context, name string, options metav1.GetOptions) (*corev1.Node, error) {
+				return &corev1.Node{
+					ObjectMeta: metav1.ObjectMeta{
+						Name: name,
+					},
+					Status: corev1.NodeStatus{
+						Addresses: []corev1.NodeAddress{
+							{
+								Type:    corev1.NodeInternalIP,
+								Address: tc.kubeletServer.host,
+							},
+						},
+						DaemonEndpoints: corev1.NodeDaemonEndpoints{
+							KubeletEndpoint: corev1.DaemonEndpoint{
+								Port: int32(tc.kubeletServer.port),
+							},
+						},
+					},
+				}, nil
+			})
+
+			kubeletClientConfig := baseKubeletClientConfig
+			kubeletClientConfig.TLSClientConfig.ValidateNodeName = tc.validateNodeName
+
+			connectionInfoGetter, err := NewNodeConnectionInfoGetter(nodeGetter, kubeletClientConfig)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			nodeInfo, err := connectionInfoGetter.GetConnectionInfo(t.Context(), tc.nodeName)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			err = makeRequestToNode(t, nodeInfo)
+			if got := errString(err); tc.expectErr != got {
+				t.Fatalf("expected error %q but got %v", tc.expectErr, err)
+			}
+		})
+	}
+}
+
+func makeRequestToNode(t *testing.T, nodeInfo *ConnectionInfo) error {
+	url := &url.URL{
+		Scheme: nodeInfo.Scheme,
+		Host:   net.JoinHostPort(nodeInfo.Hostname, nodeInfo.Port),
+	}
+
+	req, err := http.NewRequest(http.MethodGet, url.String(), nil)
+	if err != nil {
+		return err
+	}
+	response, err := nodeInfo.Transport.RoundTrip(req)
+	if err != nil {
+		return err
+	}
+
+	if response.StatusCode != http.StatusOK {
+		dump, err := httputil.DumpResponse(response, true)
+		if err != nil {
+			return err
+		}
+		return fmt.Errorf("expected status code %d but got %d: %s", http.StatusOK, response.StatusCode, string(dump))
+	}
+
+	return nil
+}
+
+func TestValidateNodeNameWithConnectionReuse(t *testing.T) {
+	caCert, caKey := createCA(t)
+	caPath := filepath.Join(t.TempDir(), "ca.crt")
+	if err := os.WriteFile(caPath, utils.EncodeCertPEM(caCert), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	kubeletServerNode1 := newKubeletServer(t, "my-node-1", caCert, caKey)
+
 	nodeGetter := NodeGetterFunc(func(ctx context.Context, name string, options metav1.GetOptions) (*corev1.Node, error) {
 		return &corev1.Node{
 			ObjectMeta: metav1.ObjectMeta{
@@ -152,7 +270,13 @@ func TestValidateNodeName(t *testing.T) {
 			Status: corev1.NodeStatus{
 				Addresses: []corev1.NodeAddress{
 					{
-						Type: corev1.NodeInternalIP,
+						Type:    corev1.NodeInternalIP,
+						Address: kubeletServerNode1.host,
+					},
+				},
+				DaemonEndpoints: corev1.NodeDaemonEndpoints{
+					KubeletEndpoint: corev1.DaemonEndpoint{
+						Port: int32(kubeletServerNode1.port),
 					},
 				},
 			},
@@ -162,83 +286,68 @@ func TestValidateNodeName(t *testing.T) {
 	kubeletClientConfig := KubeletClientConfig{
 		TLSClientConfig: KubeletTLSConfig{
 			CAFile:           caPath,
-			ValidateNodeName: false,
+			ValidateNodeName: true,
 		},
 		PreferredAddressTypes: []string{
 			string(corev1.NodeInternalIP),
 		},
 	}
-	nodeConnectionInfoGetter, err := NewNodeConnectionInfoGetter(nodeGetter, kubeletClientConfig)
+
+	connectionInfoGetter, err := NewNodeConnectionInfoGetter(nodeGetter, kubeletClientConfig)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	kubeletClientConfigWithValidateNodeName := kubeletClientConfig
-	kubeletClientConfigWithValidateNodeName.TLSClientConfig.ValidateNodeName = true
-	nodeConnectionInfoGetterWithValidateNodeName, err := NewNodeConnectionInfoGetter(nodeGetter, kubeletClientConfigWithValidateNodeName)
-	if err != nil {
-		t.Fatal(err)
-	}
+	t.Run("connecting to the right node", func(t *testing.T) {
+		nodeInfo, err := connectionInfoGetter.GetConnectionInfo(t.Context(), "my-node-1")
+		if err != nil {
+			t.Fatal(err)
+		}
 
-	// TODO test with multiple nodes and with connection re-use
+		// this should succeed because we are using the right node name
+		if err := makeRequestToNode(t, nodeInfo); err != nil {
+			t.Fatal(err)
+		}
+	})
 
-	testCases := []struct {
-		name                 string
-		kubeletServer        *fakeKubeletServer
-		nodeName             types.NodeName
-		connectionInfoGetter ConnectionInfoGetter
-		expectErr            string
-	}{
-		{
-			name:                 "valid cert",
-			nodeName:             "my-node-1",
-			kubeletServer:        kubeletServerNode1,
-			connectionInfoGetter: nodeConnectionInfoGetterWithValidateNodeName,
-		},
-		{
-			name:                 "invalid cert without validation",
-			nodeName:             "my-node-1",
-			kubeletServer:        kubeletServerNode2,
-			connectionInfoGetter: nodeConnectionInfoGetter,
-		},
-		{
-			name:                 "invalid cert with validation",
-			nodeName:             "my-node-1",
-			kubeletServer:        kubeletServerNode2,
-			connectionInfoGetter: nodeConnectionInfoGetterWithValidateNodeName,
-			expectErr:            `invalid node name; expected "system:node:my-node-1", got "system:node:my-node-2"`,
-		},
-	}
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			nodeInfo, err := tc.connectionInfoGetter.GetConnectionInfo(t.Context(), tc.nodeName)
-			if err != nil {
-				t.Fatal(err)
-			}
+	t.Run("connecting to the wrong node", func(t *testing.T) {
+		nodeInfo, err := connectionInfoGetter.GetConnectionInfo(t.Context(), "my-node-2")
+		if err != nil {
+			t.Fatal(err)
+		}
 
-			req, err := http.NewRequest(http.MethodGet, tc.kubeletServer.server.URL, nil)
-			if err != nil {
-				t.Fatal(err)
-			}
-			response, err := nodeInfo.Transport.RoundTrip(req)
+		// this should fail because we are using the wrong node name
+		// the connection should not be reused even if the destination IP is the same
+		// which should re-run the cert validation
+		err = makeRequestToNode(t, nodeInfo)
+		if err == nil {
+			t.Fatal("expected error but got nil")
+		}
 
-			if got := errString(err); tc.expectErr != got {
-				t.Fatalf("expected error %q but got %v", tc.expectErr, err)
-			}
+		if errString(err) != `invalid node name; expected "system:node:my-node-2", got "system:node:my-node-1"` {
+			t.Fatalf("expected error %q but got %v", `invalid node name; expected "system:node:my-node-2", got "system:node:my-node-1"`, err)
+		}
+	})
 
-			if err == nil && response.StatusCode != http.StatusOK {
-				dump, err := httputil.DumpResponse(response, true)
-				if err != nil {
-					t.Fatal(err)
-				}
-				t.Fatal(string(dump))
-			}
-		})
-	}
+	t.Run("reusing the connection to the right node", func(t *testing.T) {
+		nodeInfo, err := connectionInfoGetter.GetConnectionInfo(t.Context(), "my-node-1")
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// this should succeed because we are using the right node name
+		// and the connection should be reused
+		if err := makeRequestToNode(t, nodeInfo); err != nil {
+			t.Fatal(err)
+		}
+	})
 }
 
 type fakeKubeletServer struct {
-	server *httptest.Server
+	server   *httptest.Server
+	port     uint64
+	nodeName string
+	host     string
 }
 
 func newKubeletServer(tb testing.TB, nodeName string, signingCert *x509.Certificate, signingKey crypto.Signer) *fakeKubeletServer {
@@ -257,8 +366,24 @@ func newKubeletServer(tb testing.TB, nodeName string, signingCert *x509.Certific
 	testServer.StartTLS()
 	tb.Cleanup(testServer.Close)
 
+	testURL, err := url.Parse(testServer.URL)
+	if err != nil {
+		tb.Fatal(err)
+	}
+	host, portStr, err := net.SplitHostPort(testURL.Host)
+	if err != nil {
+		tb.Fatal(err)
+	}
+	port, err := strconv.ParseUint(portStr, 10, 32)
+	if err != nil {
+		tb.Fatal(err)
+	}
+
 	return &fakeKubeletServer{
-		server: testServer,
+		server:   testServer,
+		port:     port,
+		nodeName: nodeName,
+		host:     host,
 	}
 }
 

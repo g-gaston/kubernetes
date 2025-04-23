@@ -29,7 +29,6 @@ import (
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
-	utilnet "k8s.io/apimachinery/pkg/util/net"
 	"k8s.io/apiserver/pkg/authentication/user"
 	"k8s.io/apiserver/pkg/server/egressselector"
 	"k8s.io/client-go/transport"
@@ -116,28 +115,6 @@ func makeTransport(config *KubeletClientConfig, insecureSkipTLSVerify bool) (htt
 		if dialer != nil {
 			transportConfig.DialHolder = &transport.DialHolder{Dial: dialer}
 		}
-	} else if config.TLSClientConfig.ValidateNodeName {
-		transportConfig.DialHolder = &transport.DialHolder{
-			DialWithTLS: func(ctx context.Context, cfg *tls.Config, network, addr string) (net.Conn, error) {
-				validator := ctx.Value(cnNameValidatorKey{})
-				cnNameValidator, ok := validator.(func(cs tls.ConnectionState) error)
-
-				tlsConfig := cfg.Clone()
-				if ok && cnNameValidator != nil {
-					tlsConfig.VerifyConnection = cnNameValidator
-				}
-
-				dialer := tls.Dialer{
-					NetDialer: &net.Dialer{
-						Timeout:   30 * time.Second,
-						KeepAlive: 30 * time.Second,
-					},
-					Config: tlsConfig,
-				}
-
-				return dialer.DialContext(ctx, network, addr)
-			},
-		}
 	}
 	return transport.New(transportConfig)
 }
@@ -193,10 +170,6 @@ type NodeConnectionInfoGetter struct {
 
 // NewNodeConnectionInfoGetter creates a new NodeConnectionInfoGetter.
 func NewNodeConnectionInfoGetter(nodes NodeGetter, config KubeletClientConfig) (ConnectionInfoGetter, error) {
-	transport, err := MakeTransport(&config)
-	if err != nil {
-		return nil, err
-	}
 	insecureSkipTLSVerifyTransport, err := MakeInsecureTransport(&config)
 	if err != nil {
 		return nil, err
@@ -205,6 +178,17 @@ func NewNodeConnectionInfoGetter(nodes NodeGetter, config KubeletClientConfig) (
 	types := []v1.NodeAddressType{}
 	for _, t := range config.PreferredAddressTypes {
 		types = append(types, v1.NodeAddressType(t))
+	}
+
+	b := &transportBuilder{
+		nodes:                 nodes,
+		config:                &config,
+		preferredAddressTypes: types,
+	}
+
+	transport, err := b.build()
+	if err != nil {
+		return nil, err
 	}
 
 	return &NodeConnectionInfoGetter{
@@ -226,63 +210,98 @@ func (k *NodeConnectionInfoGetter) GetConnectionInfo(ctx context.Context, nodeNa
 		return nil, err
 	}
 
-	// Find a kubelet-reported address, using preferred address type
-	host, err := nodeutil.GetPreferredNodeAddress(node, k.preferredAddressTypes)
-	if err != nil {
-		return nil, err
-	}
-
 	// Use the kubelet-reported port, if present
 	port := int(node.Status.DaemonEndpoints.KubeletEndpoint.Port)
 	if port <= 0 {
 		port = k.defaultPort
 	}
 
-	rt := k.transport
-	if k.validateNodeName {
-		rt = &validateNodeNameRoundTripper{
-			nodeName: nodeName,
-			delegate: rt,
-		}
-	}
-
 	return &ConnectionInfo{
 		Scheme:                         k.scheme,
-		Hostname:                       host,
+		Hostname:                       string(nodeName),
 		Port:                           strconv.Itoa(port),
-		Transport:                      rt,
+		Transport:                      k.transport,
 		InsecureSkipTLSVerifyTransport: k.insecureSkipTLSVerifyTransport,
 	}, nil
 }
 
-var errNodeNameValidationSkipped = fmt.Errorf("node name was not validated")
-
-var _ utilnet.RoundTripperWrapper = &validateNodeNameRoundTripper{}
-
-type validateNodeNameRoundTripper struct {
-	nodeName types.NodeName
-	delegate http.RoundTripper
+type transportBuilder struct {
+	nodes                 NodeGetter
+	preferredAddressTypes []v1.NodeAddressType
+	config                *KubeletClientConfig
 }
 
-func (r *validateNodeNameRoundTripper) WrappedRoundTripper() http.RoundTripper {
-	return r.delegate
-}
+// build creates a RoundTripper for HTTP Transport.
+func (t *transportBuilder) build() (http.RoundTripper, error) {
+	transportConfig := t.config.transportConfig()
 
-func (r *validateNodeNameRoundTripper) RoundTrip(req *http.Request) (rtResp *http.Response, rtErr error) {
-	ctx := req.Context()
-	ctx = context.WithValue(ctx, cnNameValidatorKey{}, r.validateNodeName)
-	req = req.Clone(ctx) // swap the context
+	if t.config.Lookup != nil {
+		// Assuming EgressSelector if SSHTunnel is not turned on.
+		// We will not get a dialer if egress selector is disabled.
+		networkContext := egressselector.Cluster.AsNetworkContext()
+		dialer, err := t.config.Lookup(networkContext)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get context dialer for 'cluster': got %v", err)
+		}
+		if dialer != nil {
+			transportConfig.DialHolder = &transport.DialHolder{Dial: dialer}
+		}
+	} else {
+		transportConfig.DialHolder = &transport.DialHolder{
+			DialWithTLS: func(ctx context.Context, tlsConfig *tls.Config, network, addr string) (net.Conn, error) {
+				dialer := tls.Dialer{
+					NetDialer: &net.Dialer{
+						Timeout:   30 * time.Second,
+						KeepAlive: 30 * time.Second,
+					},
+					Config: tlsConfig,
+				}
 
-	return r.delegate.RoundTrip(req)
-}
+				nodeName, port, err := net.SplitHostPort(addr)
+				if err != nil {
+					return nil, err
+				}
 
-func (r *validateNodeNameRoundTripper) validateNodeName(cs tls.ConnectionState) error {
-	leaf := cs.PeerCertificates[0]
-	if expectedNodeName := "system:node:" + string(r.nodeName); leaf.Subject.CommonName != expectedNodeName {
-		return fmt.Errorf("invalid node name; expected %q, got %q", expectedNodeName, leaf.Subject.CommonName)
+				if t.config.TLSClientConfig.ValidateNodeName {
+					tlsConfig.VerifyConnection = nodeNameValidator(nodeName)
+				}
+
+				host, err := t.getNodeHost(ctx, nodeName)
+				if err != nil {
+					return nil, err
+				}
+
+				return dialer.DialContext(ctx, network, net.JoinHostPort(host, port))
+			},
+		}
 	}
-	if !slices.Contains(leaf.Subject.Organization, user.NodesGroup) {
-		return fmt.Errorf("invalid node groups; expected to include %q, got %q", user.NodesGroup, leaf.Subject.Organization)
+	return transport.New(transportConfig)
+}
+
+func (t *transportBuilder) getNodeHost(ctx context.Context, nodeName string) (string, error) {
+	node, err := t.nodes.Get(ctx, nodeName, metav1.GetOptions{})
+	if err != nil {
+		return "", err
 	}
-	return nil
+
+	// Find a kubelet-reported address, using preferred address type
+	host, err := nodeutil.GetPreferredNodeAddress(node, t.preferredAddressTypes)
+	if err != nil {
+		return "", err
+	}
+
+	return host, nil
+}
+
+func nodeNameValidator(nodeName string) func(cs tls.ConnectionState) error {
+	return func(cs tls.ConnectionState) error {
+		leaf := cs.PeerCertificates[0]
+		if expectedNodeName := "system:node:" + nodeName; leaf.Subject.CommonName != expectedNodeName {
+			return fmt.Errorf("invalid node name; expected %q, got %q", expectedNodeName, leaf.Subject.CommonName)
+		}
+		if !slices.Contains(leaf.Subject.Organization, user.NodesGroup) {
+			return fmt.Errorf("invalid node groups; expected to include %q, got %q", user.NodesGroup, leaf.Subject.Organization)
+		}
+		return nil
+	}
 }
