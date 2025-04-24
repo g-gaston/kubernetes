@@ -43,18 +43,18 @@ type dynamicClientCert struct {
 	clientCert *tls.Certificate
 	certMtx    sync.RWMutex
 
-	reload     reloadFunc
-	connDialer *connrotation.Dialer
+	reload      reloadFunc
+	connTracker *connrotation.ConnectionTracker
 
 	// queue only ever has one item, but it has nice error handling backoff/retry semantics
 	queue workqueue.TypedRateLimitingInterface[string]
 }
 
-func certRotatingDialer(logger klog.Logger, reload reloadFunc, dial utilnet.DialFunc) *dynamicClientCert {
+func certRotatingDialer(logger klog.Logger, reload reloadFunc) *dynamicClientCert {
 	d := &dynamicClientCert{
-		logger:     logger,
-		reload:     reload,
-		connDialer: connrotation.NewDialer(connrotation.DialFunc(dial)),
+		logger:      logger,
+		reload:      reload,
+		connTracker: connrotation.NewConnectionTracker(),
 		queue: workqueue.NewTypedRateLimitingQueueWithConfig(
 			workqueue.DefaultTypedControllerRateLimiter[string](),
 			workqueue.TypedRateLimitingQueueConfig[string]{Name: "DynamicClientCertificate"},
@@ -62,6 +62,14 @@ func certRotatingDialer(logger klog.Logger, reload reloadFunc, dial utilnet.Dial
 	}
 
 	return d
+}
+
+// newDialer creates a new dialer that tracks connections
+// with the shared connection tracker.
+// When a certificate rotation is detected, all connections
+// opened by this dialer will be closed.
+func (c *dynamicClientCert) newDialer(dial utilnet.DialFunc) *connrotation.Dialer {
+	return connrotation.NewDialerWithTracker(connrotation.DialFunc(dial), c.connTracker)
 }
 
 // loadClientCert calls the callback and rotates connections if needed
@@ -90,7 +98,7 @@ func (c *dynamicClientCert) loadClientCert() (*tls.Certificate, error) {
 	}
 
 	c.logger.V(1).Info("Certificate rotation detected, shutting down client connections to start using new credentials")
-	c.connDialer.CloseAll()
+	c.connTracker.CloseAll()
 
 	return cert, nil
 }

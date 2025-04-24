@@ -65,7 +65,7 @@ func isValidHolders(config *Config) bool {
 		return false
 	}
 
-	if config.DialHolder != nil && ((config.DialHolder.Dial == nil && config.DialHolder.DialWithTLS == nil) || (config.DialHolder.Dial != nil && config.DialHolder.DialWithTLS != nil)) {
+	if config.DialHolder != nil && config.DialHolder.Dial == nil && config.DialHolder.DialWithTLS == nil {
 		return false
 	}
 

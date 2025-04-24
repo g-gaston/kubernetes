@@ -105,15 +105,18 @@ func (c *tlsTransportCache) get(config *Config) (http.RoundTripper, error) {
 	}
 
 	var dial func(ctx context.Context, network, address string) (net.Conn, error)
+	var dialTLS func(ctx context.Context, network, address string) (net.Conn, error)
 	if config.DialHolder != nil {
 		if config.DialHolder.Dial != nil {
 			dial = config.DialHolder.Dial
-		} else if config.DialHolder.DialWithTLS != nil {
-			dial = func(ctx context.Context, network, address string) (net.Conn, error) {
+		}
+		if config.DialHolder.DialWithTLS != nil {
+			dialTLS = func(ctx context.Context, network, address string) (net.Conn, error) {
 				return config.DialHolder.DialWithTLS(ctx, tlsConfig.Clone(), network, address)
 			}
 		}
-	} else {
+	}
+	if dial == nil {
 		dial = (&net.Dialer{
 			Timeout:   30 * time.Second,
 			KeepAlive: 30 * time.Second,
@@ -126,9 +129,12 @@ func (c *tlsTransportCache) get(config *Config) (http.RoundTripper, error) {
 		// The TLS cache is a singleton, so sharing the same name for all of its
 		// background activity seems okay.
 		logger := klog.Background().WithName("tls-transport-cache")
-		dynamicCertDialer := certRotatingDialer(logger, tlsConfig.GetClientCertificate, dial)
+		dynamicCertDialer := certRotatingDialer(logger, tlsConfig.GetClientCertificate)
 		tlsConfig.GetClientCertificate = dynamicCertDialer.GetClientCertificate
-		dial = dynamicCertDialer.connDialer.DialContext
+		dial = dynamicCertDialer.newDialer(dial).DialContext
+		if dialTLS != nil {
+			dialTLS = dynamicCertDialer.newDialer(dialTLS).DialContext
+		}
 		go dynamicCertDialer.run(DialerStopCh)
 	}
 
@@ -145,10 +151,9 @@ func (c *tlsTransportCache) get(config *Config) (http.RoundTripper, error) {
 		DisableCompression:  config.DisableCompression,
 	}
 
-	if config.DialHolder != nil && config.DialHolder.DialWithTLS != nil {
-		transport.DialTLSContext = dial
-	} else {
-		transport.DialContext = dial
+	transport.DialContext = dial
+	if dialTLS != nil {
+		transport.DialTLSContext = dialTLS
 	}
 
 	utilnet.SetTransportDefaults(transport)

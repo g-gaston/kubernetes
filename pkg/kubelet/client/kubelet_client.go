@@ -24,6 +24,7 @@ import (
 	"net/http"
 	"slices"
 	"strconv"
+	"strings"
 	"time"
 
 	v1 "k8s.io/api/core/v1"
@@ -90,9 +91,6 @@ func MakeTransport(config *KubeletClientConfig) (http.RoundTripper, error) {
 func MakeInsecureTransport(config *KubeletClientConfig) (http.RoundTripper, error) {
 	return makeTransport(config, true)
 }
-
-// cnNameValidatorKey is a context key for the cnNameValidator.
-type cnNameValidatorKey struct{}
 
 // makeTransport creates a RoundTripper for HTTP Transport.
 func makeTransport(config *KubeletClientConfig, insecureSkipTLSVerify bool) (http.RoundTripper, error) {
@@ -216,9 +214,20 @@ func (k *NodeConnectionInfoGetter) GetConnectionInfo(ctx context.Context, nodeNa
 		port = k.defaultPort
 	}
 
+	// if we validate the node name, we use the node name as the host
+	// so the connection gets keyed in the cache by the node name
+	// otherwise we use the preferred node address
+	host := string(nodeName)
+	if !k.validateNodeName {
+		host, err = nodeutil.GetPreferredNodeAddress(node, k.preferredAddressTypes)
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	return &ConnectionInfo{
 		Scheme:                         k.scheme,
-		Hostname:                       string(nodeName),
+		Hostname:                       host,
 		Port:                           strconv.Itoa(port),
 		Transport:                      k.transport,
 		InsecureSkipTLSVerifyTransport: k.insecureSkipTLSVerifyTransport,
@@ -246,39 +255,79 @@ func (t *transportBuilder) build() (http.RoundTripper, error) {
 		if dialer != nil {
 			transportConfig.DialHolder = &transport.DialHolder{Dial: dialer}
 		}
-	} else {
+	}
+
+	if t.config.TLSClientConfig.ValidateNodeName {
 		transportConfig.DialHolder = &transport.DialHolder{
 			DialWithTLS: func(ctx context.Context, tlsConfig *tls.Config, network, addr string) (net.Conn, error) {
-				dialer := tls.Dialer{
-					NetDialer: &net.Dialer{
+				// If we have a customer dialer for egress selector, we use it to first obtain the connection
+				// and then we add TLS to it.
+				// If not, we use a default net dialer.
+				netDial := transportConfig.DialHolder.Dial
+				if netDial == nil {
+					netDial = (&net.Dialer{
 						Timeout:   30 * time.Second,
 						KeepAlive: 30 * time.Second,
-					},
-					Config: tlsConfig,
+					}).DialContext
 				}
 
-				nodeName, port, err := net.SplitHostPort(addr)
-				if err != nil {
-					return nil, err
-				}
-
-				if t.config.TLSClientConfig.ValidateNodeName {
-					tlsConfig.VerifyConnection = nodeNameValidator(nodeName)
-				}
-
-				host, err := t.getNodeHost(ctx, nodeName)
-				if err != nil {
-					return nil, err
-				}
-
-				return dialer.DialContext(ctx, network, net.JoinHostPort(host, port))
+				tlsDialer := newTLSDialerForNode(t.nodes, t.preferredAddressTypes, netDial, tlsConfig)
+				return tlsDialer.dial(ctx, network, addr)
 			},
 		}
 	}
 	return transport.New(transportConfig)
 }
 
-func (t *transportBuilder) getNodeHost(ctx context.Context, nodeName string) (string, error) {
+func newTLSDialerForNode(nodes NodeGetter, preferredAddressTypes []v1.NodeAddressType, netDial dialer, config *tls.Config) *tlsDialerForNode {
+	return &tlsDialerForNode{
+		tlsDialer:             *newTLSDialer(netDial, config),
+		nodes:                 nodes,
+		preferredAddressTypes: preferredAddressTypes,
+	}
+}
+
+type tlsDialerForNode struct {
+	tlsDialer
+	nodes                 NodeGetter
+	preferredAddressTypes []v1.NodeAddressType
+}
+
+// dial opens a TLS connection to a node and validates that the CN of the server certificate
+// matches the node name and that the node is in the nodes group.
+// addr is expected to be in the format "node-name:port".
+func (t *tlsDialerForNode) dial(ctx context.Context, network, addr string) (*tls.Conn, error) {
+	nodeName, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return nil, err
+	}
+
+	host, err := t.getNodeHost(ctx, nodeName)
+	if err != nil {
+		return nil, err
+	}
+
+	tlsConn, err := t.tlsDialer.dial(ctx, network, net.JoinHostPort(host, port))
+	if err != nil {
+		return nil, err
+	}
+
+	cs := tlsConn.ConnectionState()
+	if !cs.HandshakeComplete {
+		return nil, fmt.Errorf("invalid connection state; handshake not complete")
+	}
+	leaf := cs.PeerCertificates[0]
+	if expectedNodeName := "system:node:" + string(nodeName); leaf.Subject.CommonName != expectedNodeName {
+		return nil, fmt.Errorf("invalid node name; expected %q, got %q", expectedNodeName, leaf.Subject.CommonName)
+	}
+	if !slices.Contains(leaf.Subject.Organization, user.NodesGroup) {
+		return nil, fmt.Errorf("invalid node groups; expected to include %q, got %q", user.NodesGroup, leaf.Subject.Organization)
+	}
+
+	return tlsConn, nil
+}
+
+func (t *tlsDialerForNode) getNodeHost(ctx context.Context, nodeName string) (string, error) {
 	node, err := t.nodes.Get(ctx, nodeName, metav1.GetOptions{})
 	if err != nil {
 		return "", err
@@ -293,15 +342,43 @@ func (t *transportBuilder) getNodeHost(ctx context.Context, nodeName string) (st
 	return host, nil
 }
 
-func nodeNameValidator(nodeName string) func(cs tls.ConnectionState) error {
-	return func(cs tls.ConnectionState) error {
-		leaf := cs.PeerCertificates[0]
-		if expectedNodeName := "system:node:" + nodeName; leaf.Subject.CommonName != expectedNodeName {
-			return fmt.Errorf("invalid node name; expected %q, got %q", expectedNodeName, leaf.Subject.CommonName)
-		}
-		if !slices.Contains(leaf.Subject.Organization, user.NodesGroup) {
-			return fmt.Errorf("invalid node groups; expected to include %q, got %q", user.NodesGroup, leaf.Subject.Organization)
-		}
-		return nil
+func newTLSDialer(netDial dialer, config *tls.Config) *tlsDialer {
+	return &tlsDialer{
+		netDial: netDial,
+		config:  config,
 	}
+}
+
+type tlsDialer struct {
+	netDial dialer
+	config  *tls.Config
+}
+
+type dialer func(ctx context.Context, network string, address string) (net.Conn, error)
+
+// dial gets a connection throught the net dialer and then adds TLS to it.
+func (t *tlsDialer) dial(ctx context.Context, network, addr string) (*tls.Conn, error) {
+	rawConn, err := t.netDial(ctx, network, addr)
+	if err != nil {
+		return nil, err
+	}
+
+	colonPos := strings.LastIndex(addr, ":")
+	if colonPos == -1 {
+		colonPos = len(addr)
+	}
+	hostname := addr[:colonPos]
+
+	// If no ServerName is set, infer the ServerName
+	// from the hostname we're connecting to.
+	if t.config.ServerName == "" {
+		t.config.ServerName = hostname
+	}
+
+	conn := tls.Client(rawConn, t.config)
+	if err := conn.HandshakeContext(ctx); err != nil {
+		rawConn.Close()
+		return nil, err
+	}
+	return conn, nil
 }
