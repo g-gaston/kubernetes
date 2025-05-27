@@ -2269,6 +2269,10 @@ function start-kube-controller-manager {
   if [[ -n "${RUN_CONTROLLERS:-}" ]]; then
     params+=("--controllers=${RUN_CONTROLLERS}")
   fi
+  if [[ "${CONTROLLER_MANAGER_SET_KUBELET_SIGNING:-false}" == "true" ]]; then
+    params+=("--cluster-signing-kubelet-serving-cert-file=${CA_CERT_PATH}")
+    params+=("--cluster-signing-kubelet-client-key-file=${CA_KEY_PATH}")
+  fi
 
   local -r kube_rc_docker_tag=$(cat /home/kubernetes/kube-docker-files/kube-controller-manager.docker_tag)
   local container_env=""

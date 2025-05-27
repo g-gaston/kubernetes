@@ -1049,6 +1049,12 @@ EOF
 shutdownGracePeriodCriticalPods: ${SHUTDOWN_GRACE_PERIOD_CRITICAL_PODS}
 EOF
   fi
+
+  if [[ "${KUBELET_SET_SERVER_TLS_BOOTSTRAP:-false}" == "true" ]]; then
+  cat <<EOF
+serverTLSBootstrap: true
+EOF
+  fi
 }
 
 # cat the Kubelet config yaml for windows nodes
@@ -2526,6 +2532,10 @@ function kube-up() {
       create-linux-nodes
     fi
     check-cluster
+
+    if [[ "${AUTO_APPROVE_KUBELET_SERVER_CSR:-false}" == "true" ]]; then
+      approve-kubelet-server-csrs
+    fi
   fi
 }
 
@@ -4237,4 +4247,42 @@ function prepare-e2e() {
 # Delete the image given by $1.
 function delete-image() {
   gcloud container images delete --quiet "$1"
+}
+
+# Approve all the existing CSRs for kubelet serving certs
+function approve-kubelet-server-csrs() {
+  detect-node-names
+  
+  echo "Approving kubelet server CSRs for nodes: ${NODE_NAMES[*]:-}" >&2
+  
+  # Get all pending CSRs with signerName kubernetes.io/kubelet-serving
+  local csrs
+  csrs=$("${KUBE_ROOT}/cluster/kubectl.sh" get csr -o jsonpath='{range .items[?(@.spec.signerName=="kubernetes.io/kubelet-serving")]}{.metadata.name}{" "}{.spec.username}{"\n"}{end}' 2>/dev/null || true)
+  
+  if [[ -z "${csrs}" ]]; then
+    echo "No kubelet-serving CSRs found" >&2
+    return 0
+  fi
+  
+  # Process each CSR
+  while IFS=' ' read -r csr_name username; do
+    if [[ -z "${csr_name}" ]]; then
+      continue
+    fi
+    
+    echo "Checking CSR: ${csr_name} for user: ${username}" >&2
+    
+    # Check if username matches system:node:<node-name> for any of our nodes
+    for node_name in "${NODE_NAMES[@]}"; do
+      if [[ "${username}" == "system:node:${node_name}" ]]; then
+        echo "Approving CSR ${csr_name} for node ${node_name}" >&2
+        if "${KUBE_ROOT}/cluster/kubectl.sh" certificate approve "${csr_name}" 2>/dev/null; then
+          echo "Successfully approved CSR ${csr_name}" >&2
+        else
+          echo "Failed to approve CSR ${csr_name}" >&2
+        fi
+        break
+      fi
+    done
+  done <<< "${csrs}"
 }

@@ -565,3 +565,22 @@ fi
 # Also, it is required that DisableKubeletCloudCredentialProviders
 # feature gates are set to true for kubelet to use external credential provider.
 export ENABLE_AUTH_PROVIDER_GCP="${ENABLE_AUTH_PROVIDER_GCP:-true}"
+
+export APISERVER_SET_KUBELET_CA="${APISERVER_SET_KUBELET_CA:-false}"
+export KUBELET_SET_SERVER_TLS_BOOTSTRAP="${KUBELET_SET_SERVER_TLS_BOOTSTRAP:-false}"
+export CONTROLLER_MANAGER_SET_KUBELET_SIGNING="${CONTROLLER_MANAGER_SET_KUBELET_SIGNING:-false}"
+export AUTO_APPROVE_KUBELET_SERVER_CSR="${AUTO_APPROVE_KUBELET_SERVER_CSR:-false}"
+
+# Optional: Enable (not self) signed server certificates for kubelet
+# When ENABLE_KUBELET_SERVER_CA is set:
+# - APISERVER_SET_KUBELET_CA is set to true so --kubelet-certificate-authority is passed to kube-apiserver
+# - KUBELET_SET_SERVER_TLS_BOOTSTRAP is set to true so serverTLSBootstrap is set to true in kubelet config
+# - CONTROLLER_MANAGER_SET_KUBELET_SIGNING is is set to true so --cluster-signing-kubelet-serving-cert-file and --cluster-signing-kubelet-client-key-file are passed to controller-manager
+# - AUTO_APPROVE_KUBELET_SERVER_CSR is set to true so kubelet server CSRs are auto-approved
+ENABLE_KUBELET_SERVER_CA="${ENABLE_KUBELET_SERVER_CA:-false}"
+if [[ "${ENABLE_KUBELET_SERVER_CA}" == "true" ]]; then
+  export APISERVER_SET_KUBELET_CA="true"
+  export KUBELET_SET_SERVER_TLS_BOOTSTRAP="true"
+  export CONTROLLER_MANAGER_SET_KUBELET_SIGNING="true"
+  export AUTO_APPROVE_KUBELET_SERVER_CSR="true"
+fi
